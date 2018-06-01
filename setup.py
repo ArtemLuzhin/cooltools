@@ -49,6 +49,9 @@ install_requires = [
     'numba',
     'click',
     'cooler>=0.7',
+    'bioframe',
+    'scikit-learn',
+    'tables'
 ]
 
 
@@ -58,13 +61,9 @@ extensions = [
         include_dirs=[np.get_include()]
     ),
     Extension(
-        "cooltools.num._numutils", ["cooltools/num/_numutils.pyx"],
+        "cooltools.lib._numutils", ["cooltools/lib/_numutils.pyx"],
         include_dirs=[np.get_include()]
     ),
-    Extension(
-        "cooltools.num.kernels", ["cooltools/num/kernels.pyx"],
-        include_dirs=[np.get_include()]
-    )
 ]
 
 packages = find_packages()

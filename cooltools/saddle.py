@@ -1,142 +1,210 @@
-"""
-Saddle plot code.
-
-Authors
-~~~~~~~
-* Anton Goloborodko
-* Nezar Abdennur
-
-"""
+from functools import partial
 from scipy.linalg import toeplitz
 from cytoolz import merge
 import numpy as np
 import pandas as pd
+from .lib import numutils
 
 
-def digitize_track(
-        bins,
-        get_track,
-        get_mask,
-        chromosomes,
-        prange=None,
-        by_percentile=False):
+def ecdf(x, v, side='left'):
     """
-    Digitize per-chromosome genomic tracks.
+    Return array `x`'s empirical CDF value(s) at the points in `v`.
+    This is based on the :func:`statsmodels.distributions.ECDF` step function. 
+    This is the inverse of `quantile`.
     
+    """
+    x = np.asarray(x)
+    ind = np.searchsorted(np.sort(x), v, side=side) - 1
+    y = np.linspace(1./len(x), 1., len(x))
+    return y[ind]
+
+
+def quantile(x, q, **kwargs):
+    """
+    Return the values of the quantile cut points specified by fractions `q` of 
+    a sequence of data given by `x`.
+    
+    """
+    x = np.asarray(x)
+    p = np.asarray(q) * 100
+    return np.nanpercentile(x, p, **kwargs)
+
+
+def digitize_track(binedges, track, chromosomes=None):
+    """
+    Digitize genomic signal tracks into integers between `1` and `n`.
+
     Parameters
     ----------
-    get_track : function
-        A function returning a genomic track given a chromosomal name/index.
-    get_mask : function
-        A function returning a binary mask of valid genomic bins given a 
-        chromosomal name/index.
-    chromosomes : list or iterator
-        A list of names/indices of all chromosomes.
-    bins : int or list or numpy.ndarray
-        If list or numpy.ndarray, `bins` must contain the bin edges for 
-        digitization.
-        If int, then the specified number of bins will be generated 
-        automatically from the genome-wide range of the track values.
-    prange : pair of floats
-        The percentile of the genome-wide range of the track values used to 
-        generate bins. E.g., if `prange`=(2. 98) the lower bin would 
-        start at the 2-nd percentile and the upper bin would end at the 98-th 
-        percentile of the genome-wide signal.
-        Use to prevent the extreme track values from exploding the bin range.
-        Is ignored if `bins` is a list or a numpy.ndarray.
-    by_percentile : bool
-        If true then the automatically generated bins will contain an equal 
-        number of genomic bins genome-wide (i.e. track values are binned 
-        according to their percentile). Otherwise, bins edges are spaced equally. 
-        Is ignored if `bins` is a list or a numpy.ndarray.
-        
+    binedges : 1D array (length n + 1)
+        Bin edges for quantization of signal. For `n` bins, there are `n + 1`
+        edges. See encoding details in Notes.
+    track : tuple of (DataFrame, str)
+        bedGraph-like dataframe along with the name of the value column.
+    chromosomes : sequence of chromosome names
+        List of chromosomes to include.
+    
     Returns
     -------
-    digitized : dict
-        A dictionary of the digitized track, split by chromosome.
-        The value of -1 corresponds to the masked genomic bins, the values of 0 
-        and the number of bin-edges (bins+1) correspond to the values lying below
-        and above the bin range limits, correspondingly.
-        See https://docs.scipy.org/doc/numpy/reference/generated/numpy.digitize.html
-        for reference.
-    binedges : numpy.ndarray
-        The edges of bins used to digitize the track.
-    """
+    digitized : DataFrame
+        New bedGraph-like dataframe with value column and an additional
+        digitized value column with name suffixed by '.d'
+    hist : 1D array (length n + 2)
+        Histogram of digitized signal values. Its length is `n + 2` because 
+        the first and last elements correspond to outliers. See notes.
+
+    Notes
+    -----
+    The digital encoding is as follows:
+
+    - `1..n` <-> values assigned to histogram bins
+    - `0` <-> left outlier values
+    - `n+1` <-> right outlier values
+    - `-1` <-> missing data (NaNs)
     
-    if not hasattr(bins, '__len__'):
-        if prange is None:
-            prange = (0, 100)
+    """
+    if not isinstance(track, tuple):
+        raise ValueError(
+            "``track`` should be a tuple of (dataframe, column_name)")
+    track, name = track
+    
+    # subset and re-order chromosome groups
+    if chromosomes is not None:
+        grouped = track.groupby('chrom')
+        track = pd.concat(grouped.get_group(chrom) for chrom in chromosomes)
+    
+    # histogram the signal
+    digitized = track.copy()
+    digitized[name+'.d'] = np.digitize(track[name].values, binedges, right=False)
+    mask = track[name].isnull()
+    digitized.loc[mask, name+'.d'] = -1
+    x = digitized[name + '.d'].values.copy()
+    x = x[(x > 0) & (x < len(binedges) + 1)]
+    hist = np.bincount(x, minlength=len(binedges) + 1)
+    return digitized, hist
 
-        fulltrack = np.concatenate([
-            get_track(chrom)[get_mask(chrom)] 
-                for chrom in chromosomes
-        ])
 
-        if by_percentile:
-            # there are bins+1 edges for bins number of bins
-            perc_edges = np.linspace(prange[0], prange[1], bins + 1)
-            binedges = np.percentile(fulltrack, perc_edges)
+def make_cis_obsexp_fetcher(clr, expected):
+    """
+    Construct a function that returns intra-chromosomal OBS/EXP.
+
+    Parameters
+    ----------
+    clr : cooler.Cooler
+        Observed matrix.
+    expected : DataFrame 
+        Diagonal summary statistics for each chromosome.
+    name : str
+        Name of data column in ``expected`` to use.
+
+    Returns
+    -------
+    getexpected(chrom, _). 2nd arg is ignored.
+
+    """
+    expected, name = expected
+    expected = {k: x.values for k, x in expected.groupby('chrom')[name]}
+    return lambda chrom, _: (
+            clr.matrix().fetch(chrom) / 
+                toeplitz(expected[chrom])
+        )
+
+
+def make_trans_obsexp_fetcher(clr, expected):
+    """
+    Construct a function that returns OBS/EXP for any pair of chromosomes.
+
+    Parameters
+    ----------
+    clr : cooler.Cooler
+        Observed matrix.
+    expected : DataFrame or scalar
+        Average trans values. If a scalar, it is assumed to be a global trans 
+        expected value. If a dataframe, it must have a MultiIndex with 'chrom1'
+        and 'chrom2' and must also have a column labeled ``name``.
+    name : str
+        Name of data column in ``expected`` if it is a data frame.
+
+    Returns
+    -----
+    getexpected(chrom1, chrom2)
+    
+    """
+    expected, name = expected
+    expected = {k: x.values for k, x in 
+                   expected.groupby(['chrom1', 'chrom2'])[name]}
+
+    def _fetch_trans_exp(chrom1, chrom2):
+        # Handle chrom flipping
+        if (chrom1, chrom2) in expected.keys():
+            return expected[chrom1, chrom2]
+        elif (chrom2, chrom1) in expected.keys():
+            return expected[chrom2, chrom1]
+        # .loc is the right way to get [chrom1,chrom2] value from MultiIndex df:
+        # https://pandas.pydata.org/pandas-docs/stable/advanced.html#advanced-indexing-with-hierarchical-index
         else:
-            lo = np.percentile(fulltrack, prange[0])
-            hi = np.percentile(fulltrack, prange[1])
-            # there are bins+1 edges for bins number of bins
-            binedges = np.linspace(lo, hi, bins + 1)
-    else:
-        binedges = bins
+            raise KeyError(
+                "trans-exp index is missing a pair of chromosomes: "
+                "{}, {}".format(chrom1,chrom2))
 
-    digitized = {}
-    for chrom in chromosomes:
-        x = np.digitize(get_track(chrom), binedges, right=False)        
-        x[~get_mask(chrom)] = -1
-        digitized[chrom] = x
+    if np.isscalar(expected):
+        return lambda chrom1, chrom2: (
+            clr.matrix().fetch(chrom1, chrom2) / expected)
+    else:
+        if name is None:
+            raise ValueError("Name of data column not provided.")
+        return lambda chrom1, chrom2: (
+                clr.matrix().fetch(chrom1, chrom2) / 
+                    _fetch_trans_exp(chrom1, chrom2))
+
+
+def _accumulate(S, C, getmatrix, digitized, chrom1, chrom2, verbose):
+    n_bins = S.shape[0]
+    matrix = getmatrix(chrom1, chrom2)
+
+    if chrom1 == chrom2:
+        for d in [-2, -1, 0, 1, 2]:
+            numutils.set_diag(matrix, np.nan, d)
+
+    if verbose:
+        print('chromosomes {} vs {}'.format(chrom1, chrom2))
         
-    return digitized, binedges
+    for i in range(n_bins):
+        row_mask = (digitized[chrom1] == i)
+        for j in range(n_bins):
+            col_mask = (digitized[chrom2] == j)
+            data = matrix[row_mask, :][:, col_mask]
+            data = data[np.isfinite(data)]
+            S[i, j] += np.sum(data)
+            C[i, j] += float(len(data))
 
 
-def fill_diagonal(A, values, k=0, wrap=False, inplace=False):
-    """
-    Based on numpy.fill_diagonal, but allows for kth diagonals as well.
-    Only works on 2D arrays.
-    """
-    if not inplace:
-        A = np.array(A)
-    else:
-        A = np.asarray(A)
-    start = k
-    end = None
-    step = A.shape[1] + 1
-    #This is needed so a tall matrix doesn't have the diagonal wrap around.
-    if not wrap:
-        end = start + A.shape[1] * A.shape[1]
-    A.flat[start:end:step] = values
-    return A
-
-
-def make_saddle(
-        get_matrix,
-        get_digitized,
-        chromosomes,
-        contact_type,
-        verbose=False):
+def make_saddle(getmatrix, binedges, digitized, contact_type, chromosomes=None, 
+                trim_outliers=False, verbose=False):
     """
     Make a matrix of average interaction probabilities between genomic bin pairs
     as a function of a specified genomic track. The provided genomic track must
-    be pre-binned (i.e. digitized).
+    be pre-quantized as integers (i.e. digitized).
     
     Parameters
     ----------
-    get_matrix : function
-        A function returning an matrix of interaction between two chromosomes 
+    getmatrix : function
+        A function returning a matrix of interaction between two chromosomes 
         given their names/indicies.
-    get_digitized : function
-        A function returning a track of the digitized target genomic track given
-        a chromosomal name/index.
-    chromosomes : list or iterator
-        A list of names/indices of all chromosomes.    
+    binedges : 1D array (length n + 1)
+        Bin edges of the digitized signal. For `n` bins, there are `n + 1`
+        edges. See :func:`digitize_track`.
+    digitized : tuple of (DataFrame, str)
+        BedGraph-like dataframe of digitized signal along with the name of
+        the digitized value column.
     contact_type : str
         If 'cis' then only cis interactions are used to build the matrix.
         If 'trans', only trans interactions are used.
-    verbose : bool
+    chromosomes : sequence of str, optional
+        A list of names/indices of all chromosomes to use.
+    trim_outliers : bool, optional
+        Remove first and last row and column from the output matrix.
+    verbose : bool, optional
         If True then reports progress.
 
     Returns
@@ -149,91 +217,105 @@ def make_saddle(
         corresponding pixel of ``interaction_sum``.
 
     """
-    if contact_type not in ['cis', 'trans']:
-        raise ValueError("The allowed values for the contact_type "
-                         "argument are 'cis' or 'trans'.")
-    
+    digitized, name = digitized
+
     # n_bins here includes 2 open bins
     # for values <lo and >hi.
-    n_bins = max([
-        get_digitized(chrom).max() 
-            for chrom in chromosomes
-    ]) + 1
-    
+    n_bins = len(binedges) + 1
     interaction_sum   = np.zeros((n_bins, n_bins))
     interaction_count = np.zeros((n_bins, n_bins))
-    
-    for k, chrom1 in enumerate(chromosomes):
-        for chrom2 in chromosomes[k:]:
-            if (((contact_type == 'trans') and (chrom1 == chrom2)) or 
-                ((contact_type == 'cis') and (chrom1 != chrom2))):
-                continue
-                
-            matrix = get_matrix(chrom1, chrom2)
-            for d in [-2, -1, 0, 1, 2]:
-                fill_diagonal(matrix, np.nan, d)
 
-            if verbose:
-                print('chromosomes {} vs {}'.format(chrom1, chrom2))
-                
-            for i in range(n_bins):
-                row_mask = (get_digitized(chrom1) == i)
-                for j in range(n_bins):
-                    col_mask = (get_digitized(chrom2) == j)
-                    data = matrix[row_mask, :][:, col_mask]
-                    data = data[np.isfinite(data)]
-                    interaction_sum[i, j]   += np.sum(data)
-                    interaction_count[i, j] += float(len(data))
+    digitized = {k: x.values for k, x in digitized.groupby('chrom')[name]}
+    if chromosomes is None:
+        chromosomes = list(digitized.keys())
+    
+    if contact_type == 'cis':
+        supports = list(zip(chromosomes, chromosomes))
+    elif contact_type == 'trans':
+        supports = list(combinations(chromosomes, 2))
+    else:
+        raise ValueError("The allowed values for the contact_type "
+                         "argument are 'cis' or 'trans'.")
+
+    for chrom1, chrom2 in supports:
+        _accumulate(interaction_sum, interaction_count, getmatrix, digitized,
+                    chrom1, chrom2, verbose)
 
     interaction_sum   += interaction_sum.T
     interaction_count += interaction_count.T
     
+    if trim_outliers:
+        interaction_sum = interaction_sum[1:-1, 1:-1]
+        interaction_count = interaction_count[1:-1, 1:-1]
+
     return interaction_sum, interaction_count
 
 
-def saddleplot(binedges,
-               digitized,
-               saddledata,
-               color,
-               cbar_label=None,
-               fig_kws=None,
-               heatmap_kws=None, 
-               margin_kws=None):
+def saddleplot(binedges, counts, saddledata, cmap='coolwarm', vmin=-1, vmax=1,
+               color=None, title=None, xlabel=None, ylabel=None, clabel=None, 
+               fig=None, fig_kws=None, heatmap_kws=None, margin_kws=None, 
+               cbar_kws=None, subplot_spec=None):
     """
-    Plot saddle data and signal histograms in the margins.
-    
+    Generate a saddle plot.
+
     Parameters
     ----------
-    binedges: 1D array
-    digitized: dict of chrom to 1D array
-    saddledata: 2D array
-    color: str
-    cbar_label: str
-    fig_kws: dict, optional
-        Extra keywords to pass to ``figure``.
+    binedges : 1D array-like
+        For `n` bins, there should be `n + 1` bin edges
+    counts : 1D array-like
+        Signal track histogram produced by `digitize_track`. It will include
+        2 flanking elements for outlier values, thus the length should be 
+        `n + 2`. 
+    saddledata : 2D array-like
+        Saddle matrix produced by `make_saddle`. It will include 2 flanking
+        rows/columns for outlier signal values, thus the shape should be
+        `(n+2, n+2)`.
+    cmap : str or matplotlib colormap
+        Colormap to use for plotting the saddle heatmap
+    vmin, vmax : float
+        Value limits for coloring the saddle heatmap
+    color : matplotlib color value
+        Face color for margin bar plots
+    fig : matplotlib Figure, optional
+        Specified figure to plot on. A new figure is created if none is 
+        provided.
+    fig_kws : dict, optional
+        Passed on to `plt.Figure()`
     heatmap_kws : dict, optional
-        Extra keywords to pass to ``imshow`` for saddle heatmap.
+        Passed on to `ax.imshow()`
     margin_kws : dict, optional
-        Extra keywords to pass to ``hist`` for left and top margins.
+        Passed on to `ax.bar()` and `ax.barh()`
+    cbar_kws : dict, optional
+        Passed on to `plt.colorbar()`
+    subplot_spec : GridSpec object
+        Specify a subregion of a figure to using a GridSpec.
+
+    Returns
+    -------
+    Dictionary of axes objects.
 
     """
-    from matplotlib.gridspec import GridSpec
+    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
     import matplotlib.pyplot as plt
+    from cytoolz import merge
 
-    # # of bins that include outliers:
-    # could use max(map(max,digitized.values())) + 1
-    # as well ...
-    n_bins = len(binedges) + 1
-    lo, hi = 0, n_bins #-0.5, n_bins - 1.5
+    n_edges = len(binedges)
+    n_bins = n_edges - 1
+    lo, hi = binedges[0], binedges[-1]
 
-    # Populate kwargs
-    fig_kws = merge(
-        dict(figsize=(5, 5)),
-        fig_kws if fig_kws is not None else {}
+    # Histogram and saddledata are flanked by outlier bins
+    n = saddledata.shape[0]
+    X, Y = np.meshgrid(binedges, binedges)
+    C = saddledata
+    hist = counts
+    if (n - n_bins) == 2:
+        C = C[1:-1, 1:-1]
+        hist = hist[1:-1]
 
-    )
-
-    # layout
+    # Layout
+    if subplot_spec is not None:
+        GridSpec = partial(GridSpecFromSubplotSpec, subplot_spec=subplot_spec)
+    grid = {}
     gs = GridSpec(
         nrows=3, 
         ncols=3, 
@@ -242,91 +324,127 @@ def saddleplot(binedges,
         wspace=0.05,
         hspace=0.05,
     )
-    fig = plt.figure(**fig_kws)
+        
+    # Figure
+    if fig is None:
+        fig_kws_default = dict(figsize=(5, 5))
+        fig_kws = merge(
+            fig_kws_default,
+            fig_kws if fig_kws is not None else {}
 
-    # heatmap
+        )
+        fig = plt.figure(**fig_kws)
+
+    # Heatmap
+    grid['ax_heatmap'] = ax = plt.subplot(gs[4])
+    heatmap_kws_default = dict( 
+        cmap='coolwarm', 
+        rasterized=True,
+        vmin=vmin,
+        vmax=vmax)
     heatmap_kws = merge(
-        dict(aspect='auto', 
-             cmap='coolwarm', 
-             interpolation='none',
-             extent=[0, n_bins, 
-                     n_bins, 0],
-             vmin=-1,
-             vmax=1),
-        heatmap_kws if heatmap_kws is not None else {}, 
-    )
+        heatmap_kws_default,
+        heatmap_kws if heatmap_kws is not None else {})
+    img = ax.pcolormesh(X, Y, C, **heatmap_kws)
     vmin = heatmap_kws['vmin']
     vmax = heatmap_kws['vmax']
-    ax = ax1 = plt.subplot(gs[4])
-    img = ax.imshow(np.log10(saddledata), **heatmap_kws)
+    plt.gca().yaxis.set_visible(False)
 
-    # bottom
-    # binedges[0] and binedges[-1] are binedges of the 
-    # leftmost and rightmost, halfopen bins correspondingly.
-    # i.e. bin with values < binedges[0]
-    # and bin with values > binedges[-1]:
-    plt.xticks(
-        [1, np.interp(0, binedges, np.arange(1,n_bins)), n_bins-1],
-        ['{:0.4f}'.format(t) for t in (binedges[0], 0, binedges[-1])],
-        rotation=90,
-    )
-    plt.yticks([])
-    plt.xlim(lo, hi)
-    plt.ylim(hi, lo)
-
+    # Margins
+    margin_kws_default = dict(
+        edgecolor='k',
+        facecolor=color,
+        linewidth=1)
     margin_kws = merge(
-        dict(bins=n_bins,
-             # making hist aligned with
-             # the imshow by +1 extending
-             # the range:
-             range=(0, n_bins),
-             histtype='stepfilled',
-             edgecolor='k',
-             facecolor=color,
-             linewidth=1),
-        margin_kws if margin_kws is not None else {},
-    )
-    
-    # left margin
-    plt.subplot(gs[3])
-    plt.hist(np.concatenate(list(digitized.values())), 
-             **merge(margin_kws, {'orientation': 'horizontal'}))
-    plt.xticks([])
-    # binedges[0] and binedges[-1] are binedges of the 
-    # leftmost and rightmost, halfopen bins correspondingly.
-    # i.e. bin with values < binedges[0]
-    # and bin with values > binedges[-1]:
-    plt.yticks(
-        [1, np.interp(0, binedges, np.arange(1,n_bins)), n_bins-1],
-        ['{:0.4f}'.format(t) for t in (binedges[0], 0, binedges[-1])],
-    )
+        margin_kws_default,
+        margin_kws if margin_kws is not None else {})
+    # left margin hist
+    grid['ax_margin_y'] = plt.subplot(gs[3], sharey=grid['ax_heatmap'])
+    plt.barh(binedges[:-1], 
+             height=np.diff(binedges), 
+             width=hist,
+             align='edge',
+             **margin_kws)
     plt.xlim(plt.xlim()[1], plt.xlim()[0])  # fliplr
-    # left histogram
     plt.ylim(hi, lo)
     plt.gca().spines['top'].set_visible(False)
     plt.gca().spines['bottom'].set_visible(False)
     plt.gca().spines['left'].set_visible(False)
-    
-    # top margin
-    plt.subplot(gs[1])
-    plt.hist(np.concatenate(list(digitized.values())), **margin_kws)
-    plt.xticks([])
-    plt.yticks([])
+    plt.gca().xaxis.set_visible(False)
+    # top margin hist
+    grid['ax_margin_x'] = plt.subplot(gs[1], sharex=grid['ax_heatmap'])
+    plt.bar(left=binedges[:-1], 
+            width=np.diff(binedges), 
+            height=hist,
+            align='edge',
+             **margin_kws)
     plt.xlim(lo, hi)
-    plt.ylim(plt.ylim()[0], plt.ylim()[1])  # correct
+    #plt.ylim(plt.ylim())  # correct
     plt.gca().spines['top'].set_visible(False)
     plt.gca().spines['right'].set_visible(False)
     plt.gca().spines['left'].set_visible(False)
-
-    # colorbar
-    plt.subplot(gs[5])
-    cb = plt.colorbar(
-        img, 
-        fraction=0.8, 
-        label=cbar_label)
+    plt.gca().xaxis.set_visible(False)
+    plt.gca().yaxis.set_visible(False)
+    
+    # Colorbar
+    grid['ax_cbar'] = plt.subplot(gs[5])
+    cbar_kws_default = dict(
+        fraction=0.8,
+        label=clabel or '')
+    cbar_kws = merge(
+        cbar_kws_default,
+        cbar_kws if cbar_kws is not None else {})
+    grid['cbar'] = cb = plt.colorbar(img, **cbar_kws)
     if vmin is not None and vmax is not None:
-        cb.set_ticks(np.arange(vmin, vmax + 0.001, 0.5))
+        # cb.set_ticks(np.arange(vmin, vmax + 0.001, 0.5))
+        # # do linspace between vmin and vmax of 5 segments and trunc to 1 decimal:
+        decimal = 10
+        nsegments = 5
+        cd_ticks = np.trunc(np.linspace(vmin, vmax, nsegments)*decimal)/decimal
+        cb.set_ticks( cd_ticks )
+
+    # extra settings
+    grid['ax_heatmap'].set_xlim(lo, hi)
+    grid['ax_heatmap'].set_ylim(hi, lo)
     plt.grid(False)
     plt.axis('off')
+    if title is not None:
+        grid['ax_margin_x'].set_title(title)
+    if xlabel is not None:
+        grid['ax_heatmap'].set_xlabel(xlabel)
+    if ylabel is not None:
+        grid['ax_margin_y'].set_ylabel(ylabel)
 
-    return fig
+    return grid
+
+
+def saddle_strength(S, C):
+    """
+    Parameters
+    ----------
+    S, C : 2D arrays, square, same shape
+        Saddle sums and counts, respectively
+        
+    Returns
+    -------
+    1D array
+    Ratios of cumulative corner interaction scores, where the saddle data is 
+    grouped over the AA+BB corners and AB+BA corners with increasing extent.
+    
+    """
+    m, n = S.shape
+    if m != n:
+        raise ValueError("`saddledata` should be square.")
+
+    ratios = np.zeros(n)
+    for k in range(1, n):
+        intra_sum = S[0:k, 0:k].sum() + S[n-k:n, n-k:n].sum() 
+        intra_count = C[0:k, 0:k].sum() + C[n-k:n, n-k:n].sum()
+        intra = intra_sum / intra_count
+        
+        inter_sum = S[0:k, n-k:n].sum() + S[n-k:n, 0:k].sum()
+        inter_count =  C[0:k, n-k:n].sum() + C[n-k:n, 0:k].sum()
+        inter = inter_sum / inter_count
+        
+        ratios[k] = intra / inter
+    return ratios

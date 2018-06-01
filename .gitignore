@@ -8,6 +8,7 @@ cooltools/__pycache__
 
 # C extensions
 *.so
+*.c
 
 # Distribution / packaging
 .Python
@@ -47,6 +48,7 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+.pytest_cache
 
 # Translations
 *.mo
