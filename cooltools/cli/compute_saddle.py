@@ -77,7 +77,8 @@ from . import cli
     help="Dump 'saddledata', 'binedges' and 'hist' arrays in a numpy-specific "
          ".npz container. Use numpy.load to load these arrays into a "
          "dict-like object. The digitized signal values are saved to a "
-         "bedGraph-style TSV.")
+         "bedGraph-style TSV.",
+    required=True)
 @click.option(
     "--fig",
     type=click.Choice(['png', 'jpg', 'svg', 'pdf', 'ps', 'eps']),
@@ -89,7 +90,8 @@ from . import cli
     '--scale',
     help="Value scale for the heatmap",
     type=click.Choice(['linear', 'log2', 'log10']),
-    default='log10')
+    default='log10',
+    show_default=True)
 @click.option(
     '--cmap',
     help="Name of matplotlib colormap",
@@ -290,7 +292,7 @@ def compute_saddle(cool_path, track_path, expected_path, contact_type, n_bins,
     digitized, hist = saddle.digitize_track(
         binedges,
         track=(track, track_name),
-        chromosomes=track_chroms)
+        regions=track_chroms)
 
     S, C = saddle.make_saddle(
         getmatrix,
