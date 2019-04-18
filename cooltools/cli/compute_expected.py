@@ -38,6 +38,12 @@ from . import cli
     show_default=True,
     )
 @click.option(
+    '--weight-name',
+    help="Use balancing weight with this name.",
+    type=str,
+    default='weight',
+    show_default=True)
+@click.option(
     "--drop-diags",
     help="Number of diagonals to neglect for cis contact type",
     type=int,
@@ -63,16 +69,18 @@ from . import cli
 #     flag_value='trans',
 #     required=True
 #     )
-def compute_expected(cool_path, nproc, chunksize, contact_type, drop_diags):
+def compute_expected(cool_path, nproc, chunksize, contact_type, weight_name, drop_diags):
     """
-    Calculate either expected Hi-C signal either for cis or for trans regions 
+    Calculate expected Hi-C signal either for cis or for trans regions
     of chromosomal interaction map.
-    
+
     COOL_PATH : The paths to a .cool file with a balanced Hi-C map.
 
     """
     clr = cooler.Cooler(cool_path)
     supports = [(chrom, 0, clr.chromsizes[chrom]) for chrom in clr.chromnames]
+    weight1 = weight_name+"1"
+    weight2 = weight_name+"2"
 
     if nproc > 1:
         pool = mp.Pool(nproc)
@@ -86,31 +94,31 @@ def compute_expected(cool_path, nproc, chunksize, contact_type, drop_diags):
                 clr,
                 supports,
                 transforms={
-                    'balanced': lambda p: p['count'] * p['weight1'] * p['weight2']
+                    'balanced': lambda p: p['count'] * p[weight1] * p[weight2]
                 },
                 chunksize=chunksize,
                 ignore_diags=drop_diags,
                 map=map_)
             result = pd.concat(
                 [tables[support] for support in supports],
-                keys=[support[0] for support in supports], 
+                keys=[support[0] for support in supports],
                 names=['chrom'])
             result['balanced.avg'] = result['balanced.sum'] / result['n_valid']
             result = result.reset_index()
 
         elif contact_type == 'trans':
             records = expected.blocksum_pairwise(
-                clr,                
-                supports, 
+                clr,
+                supports,
                 transforms={
-                    'balanced': lambda p: p['count'] * p['weight1'] * p['weight2']
+                    'balanced': lambda p: p['count'] * p[weight1] * p[weight2]
                 },
                 chunksize=chunksize,
                 map=map_)
             result = pd.DataFrame(
-                [{'chrom1': s1[0], 'chrom2': s2[0], **rec} 
-                    for (s1, s2), rec in records.items()], 
-                columns=['chrom1', 'chrom2', 'n_valid', 
+                [{'chrom1': s1[0], 'chrom2': s2[0], **rec}
+                    for (s1, s2), rec in records.items()],
+                columns=['chrom1', 'chrom2', 'n_valid',
                          'count.sum', 'balanced.sum'])
             result['balanced.avg'] = result['balanced.sum'] / result['n_valid']
     finally:
